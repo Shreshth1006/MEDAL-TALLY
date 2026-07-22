@@ -1,0 +1,9 @@
+.env
+out/
+ndtv_profile/
+__pycache__/
+*.pyc
+.DS_Store
+blocked_final.html
+ndtv_debug.html
+ndtv_debug_raw.json

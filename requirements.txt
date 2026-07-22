@@ -1,0 +1,5 @@
+scrapfly-sdk
+beautifulsoup4
+supabase
+python-dotenv
+playwright
