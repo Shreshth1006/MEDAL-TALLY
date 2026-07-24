@@ -1,6 +1,5 @@
 """
-cwg_tally.py — scrape the Flourish medal table embedded in BBC's CWG article,
-via Scrapfly (JS rendering + anti-bot), upsert into Supabase medal_tally.
+ndtv_scrape.py — scrape NDTV's redesigned CWG medals-tally page, upsert into Supabase.
 """
 import os, sys, json, pathlib, datetime as dt
 from dotenv import load_dotenv
@@ -10,16 +9,20 @@ from bs4 import BeautifulSoup
 from scrapfly import ScrapflyClient, ScrapeConfig
 from supabase import create_client
 
-FLOURISH_URL = "https://flo.uri.sh/visualisation/29748648/embed?auto=1"
-EXPECTED_NATIONS = 74
+NDTV_URL = "https://sports.ndtv.com/commonwealth-games-2026/medals-tally"
 OUT = pathlib.Path("out"); OUT.mkdir(exist_ok=True)
+EXPECTED_NATIONS = 74
 
+# maps NDTV's raw scraped name -> the exact name already stored in medal_tally
 NAME_MAP = {
-    "Antigua and Barbuda": "Antigua & Barbuda",
-    "Saint Helena": "St Helena",
-    "Saint Kitts and Nevis": "Saint Kitts & Nevis",
-    "Saint Vincent and the Grenadines": "St Vincent & The Grenadines",
-    "Turks and Caicos Islands": "Turks & Caicos",
+    "Brunei": "Brunei Darussalam",
+    "Gambia": "The Gambia",
+    "St Vincent and the Grenadines": "Saint Vincent and the Grenadines",
+    # harmless safety nets in case NDTV shortens these too, later
+    "Antigua & Barbuda": "Antigua and Barbuda",
+    "St Helena": "Saint Helena",
+    "Saint Kitts & Nevis": "Saint Kitts and Nevis",
+    "Turks & Caicos": "Turks and Caicos Islands",
 }
 
 scrapfly = ScrapflyClient(key=os.environ["SCRAPFLY_API_KEY"])
@@ -28,41 +31,42 @@ supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
 def fetch_html() -> str:
     config = ScrapeConfig(
-        url=FLOURISH_URL,
+        url=NDTV_URL,
         render_js=True,
-        wait_for_selector="table#table-inner tbody tr",
+        wait_for_selector="ul.OlyT_ul li.OlyT_li",
         rendering_wait=3000,
         asp=True,
-        country="GB",
+        country="IN",
     )
     result = scrapfly.scrape(config)
-    (OUT / "flourish_debug.html").write_text(result.content)
+    (OUT / "ndtv_debug.html").write_text(result.content)
     return result.content
-
-
-def cell_value(td) -> str:
-    body = td.select_one("div.cell-body")
-    return (body.get_text(strip=True) if body else td.get_text(strip=True))
 
 
 def parse(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.select_one("table#table-inner")
-    if not table:
-        raise RuntimeError("DRIFT: table#table-inner not found — Flourish markup changed")
+    container = soup.select_one("ul.OlyT_ul")
+    if not container:
+        raise RuntimeError("DRIFT: ul.OlyT_ul not found — NDTV markup changed again")
 
     rows = []
-    for tr in table.select("tbody tr"):
-        tds = tr.select("td")
-        if len(tds) < 5:
+    for li in container.select("li.OlyT_li"):
+        name_div = li.select_one(".OlyT_tab-nweb") or li.select_one(".OlyT_tab-nwap")
+        country = name_div.get_text(strip=True) if name_div else None
+        if not country:
             continue
-        cells = [cell_value(td) for td in tds[:5]]
-        country, g, s, b, tot = cells
-        try:
-            g, s, b, tot = int(g), int(s), int(b), int(tot)
-        except ValueError:
+
+        rt = li.select_one(".OlyT_tab-rt")
+        if not rt:
             continue
-        country = NAME_MAP.get(country, country)
+
+        nums = [d.get_text(strip=True) for d in rt.find_all("div")
+                if d.get_text(strip=True).lstrip("-").isdigit()]
+        if len(nums) < 4:
+            continue
+
+        g, s, b, tot = (int(x) for x in nums[:4])
+        country = NAME_MAP.get(country, country)   # <-- mapping applied here, before anything else touches this value
         rows.append({"country_name": country, "gold": g, "silver": s,
                      "bronze": b, "total": tot})
     return rows
@@ -96,6 +100,18 @@ def validate(rows: list[dict]) -> list[str]:
     return errs
 
 
+def verify_names_match(rows: list[dict]):
+    existing = supabase.table("medal_tally").select("country_name").execute()
+    existing_names = {r["country_name"] for r in existing.data}
+    scraped_names = {r["country_name"] for r in rows}
+
+    unknown = scraped_names - existing_names
+    if unknown:
+        raise RuntimeError(
+            f"DRIFT: scraped names not in medal_tally, would create duplicate rows: {sorted(unknown)}"
+        )
+
+
 def upsert(rows: list[dict], stamp: str):
     payload = []
     for r in rows:
@@ -103,13 +119,13 @@ def upsert(rows: list[dict], stamp: str):
             "country_name": r["country_name"],
             "gold": r["gold"], "silver": r["silver"],
             "bronze": r["bronze"],
-            # total intentionally omitted — it's a generated column in Postgres
             "rank": r["rank"],
             "updated_at": stamp,
         })
     resp = supabase.table("medal_tally").upsert(payload, on_conflict="country_name").execute()
     print(f"upserted {len(resp.data)} rows to Supabase")
-    
+
+
 if __name__ == "__main__":
     html = fetch_html()
     rows = parse(html)
@@ -126,4 +142,5 @@ if __name__ == "__main__":
             print("  -", e, file=sys.stderr)
         sys.exit(1)
 
+    verify_names_match(rows)
     upsert(rows, stamp)
