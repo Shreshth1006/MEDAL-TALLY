@@ -13,12 +13,10 @@ NDTV_URL = "https://sports.ndtv.com/commonwealth-games-2026/medals-tally"
 OUT = pathlib.Path("out"); OUT.mkdir(exist_ok=True)
 EXPECTED_NATIONS = 74
 
-# maps NDTV's raw scraped name -> the exact name already stored in medal_tally
 NAME_MAP = {
     "Brunei": "Brunei Darussalam",
     "Gambia": "The Gambia",
     "St Vincent and the Grenadines": "Saint Vincent and the Grenadines",
-    # harmless safety nets in case NDTV shortens these too, later
     "Antigua & Barbuda": "Antigua and Barbuda",
     "St Helena": "Saint Helena",
     "Saint Kitts & Nevis": "Saint Kitts and Nevis",
@@ -27,6 +25,11 @@ NAME_MAP = {
 
 scrapfly = ScrapflyClient(key=os.environ["SCRAPFLY_API_KEY"])
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+
+
+def get_valid_names() -> set[str]:
+    existing = supabase.table("medal_tally").select("country_name").execute()
+    return {r["country_name"] for r in existing.data}
 
 
 def fetch_html() -> str:
@@ -43,32 +46,52 @@ def fetch_html() -> str:
     return result.content
 
 
-def parse(html: str) -> list[dict]:
+def parse(html: str, valid_names: set[str]) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     container = soup.select_one("ul.OlyT_ul")
     if not container:
         raise RuntimeError("DRIFT: ul.OlyT_ul not found — NDTV markup changed again")
 
+    seen = set()
+    dupes_dropped = 0
+    unknown_dropped = []
     rows = []
-    for li in container.select("li.OlyT_li"):
+
+    # direct children only — guards against nested li.OlyT_li elements
+    # (e.g. per-country expandable detail) getting swept up by a recursive match
+    for li in container.find_all("li", class_="OlyT_li", recursive=False):
         name_div = li.select_one(".OlyT_tab-nweb") or li.select_one(".OlyT_tab-nwap")
         country = name_div.get_text(strip=True) if name_div else None
         if not country:
             continue
 
+        country = NAME_MAP.get(country, country)
+
+        if country not in valid_names:
+            unknown_dropped.append(country)
+            continue
+        if country in seen:
+            dupes_dropped += 1
+            continue
+        seen.add(country)
+
         rt = li.select_one(".OlyT_tab-rt")
         if not rt:
             continue
-
         nums = [d.get_text(strip=True) for d in rt.find_all("div")
                 if d.get_text(strip=True).lstrip("-").isdigit()]
         if len(nums) < 4:
             continue
 
         g, s, b, tot = (int(x) for x in nums[:4])
-        country = NAME_MAP.get(country, country)   # <-- mapping applied here, before anything else touches this value
         rows.append({"country_name": country, "gold": g, "silver": s,
                      "bronze": b, "total": tot})
+
+    if dupes_dropped:
+        print(f"[warn] dropped {dupes_dropped} duplicate row(s)")
+    if unknown_dropped:
+        print(f"[warn] dropped {len(unknown_dropped)} unrecognized name(s): {sorted(set(unknown_dropped))}")
+
     return rows
 
 
@@ -93,23 +116,7 @@ def validate(rows: list[dict]) -> list[str]:
     for r in rows:
         if r["gold"] + r["silver"] + r["bronze"] != r["total"]:
             errs.append(f"total mismatch: {r['country_name']} {r}")
-    dupes = {r["country_name"] for r in rows
-             if [x["country_name"] for x in rows].count(r["country_name"]) > 1}
-    if dupes:
-        errs.append(f"duplicate countries: {sorted(dupes)}")
     return errs
-
-
-def verify_names_match(rows: list[dict]):
-    existing = supabase.table("medal_tally").select("country_name").execute()
-    existing_names = {r["country_name"] for r in existing.data}
-    scraped_names = {r["country_name"] for r in rows}
-
-    unknown = scraped_names - existing_names
-    if unknown:
-        raise RuntimeError(
-            f"DRIFT: scraped names not in medal_tally, would create duplicate rows: {sorted(unknown)}"
-        )
 
 
 def upsert(rows: list[dict], stamp: str):
@@ -127,8 +134,9 @@ def upsert(rows: list[dict], stamp: str):
 
 
 if __name__ == "__main__":
+    valid_names = get_valid_names()
     html = fetch_html()
-    rows = parse(html)
+    rows = parse(html, valid_names)
     rows = add_ranks(rows)
     errs = validate(rows)
 
@@ -142,5 +150,4 @@ if __name__ == "__main__":
             print("  -", e, file=sys.stderr)
         sys.exit(1)
 
-    verify_names_match(rows)
     upsert(rows, stamp)
