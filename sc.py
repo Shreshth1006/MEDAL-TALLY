@@ -1,5 +1,7 @@
 """
-ndtv_scrape.py — scrape NDTV's redesigned CWG medals-tally page, upsert into Supabase.
+asian_games_scrape.py — scrape NDTV's Asian Games 2026 medals-tally page,
+upsert into Supabase. Same NDTV template/markup as the CWG scraper, just a
+different competition + table.
 """
 import os, sys, json, pathlib, datetime as dt
 from dotenv import load_dotenv
@@ -9,27 +11,45 @@ from bs4 import BeautifulSoup
 from scrapfly import ScrapflyClient, ScrapeConfig
 from supabase import create_client
 
-NDTV_URL = "https://sports.ndtv.com/commonwealth-games-2026/medals-tally"
+NDTV_URL = "https://sports.ndtv.com/asian-games-2026/medals-tally"
 OUT = pathlib.Path("out"); OUT.mkdir(exist_ok=True)
-EXPECTED_NATIONS = 74
+EXPECTED_NATIONS = 45  # official OCA member count
 
+# Maps NDTV's displayed name -> the table's actual canonical country_name.
+# 7 of these target the SHORT common names (South Korea, China, Hong Kong,
+# Macau, Laos, North Korea, Syria) after running rename_long_country_names.py
+# to rename those rows away from the unwieldy official OCA/UN names —
+# run that migration BEFORE this scraper, or these rows will go unmatched.
 NAME_MAP = {
-    "Brunei": "Brunei Darussalam",
-    "Gambia": "The Gambia",
-    "St Vincent and the Grenadines": "Saint Vincent and the Grenadines",
-    "Antigua & Barbuda": "Antigua and Barbuda",
-    "St Helena": "Saint Helena",
-    "Saint Kitts & Nevis": "Saint Kitts and Nevis",
-    "Turks & Caicos": "Turks and Caicos Islands",
+    "Brunei Darussalam": "Brunei",
+    "Islamic Republic of Iran": "Iran",
+    "Democratic Republic of Timor-Leste": "Timor-Leste",
+    "Syrian Arab Republic": "Syria",
+    "Democratic People's Republic of Korea": "North Korea",
+    "Democratic People’s Republic of Korea": "North Korea",
+    "Lao People's Democratic Republic": "Laos",
+    "Lao People’s Democratic Republic": "Laos",
+    "People's Republic of China": "China",
+    "People’s Republic of China": "China",
+    "Republic of Korea": "South Korea",
+    "Hong Kong, China": "Hong Kong",
+    "Macau, China": "Macau",
 }
 
 scrapfly = ScrapflyClient(key=os.environ["SCRAPFLY_API_KEY"])
+# NOTE: this table has read-only RLS like medal_tally did, so SUPABASE_KEY
+# in .env must hold the "secret" key (sb_secret_...), not the
+# "publishable" one (sb_publishable_...) — the latter will fail the
+# upsert with a 42501 RLS error.
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
 
-def get_valid_names() -> set[str]:
-    existing = supabase.table("medal_tally").select("country_name").execute()
-    return {r["country_name"] for r in existing.data}
+def get_country_map() -> dict[str, str]:
+    """country_name -> short_name, pulled live from the table so we never
+    have to guess codes ourselves (short_name is NOT NULL, so it must be
+    included on every upsert row, insert or update)."""
+    existing = supabase.table("asian_games_medal_tally").select("country_name, short_name").execute()
+    return {r["country_name"]: r["short_name"] for r in existing.data}
 
 
 def fetch_html() -> str:
@@ -42,11 +62,11 @@ def fetch_html() -> str:
         country="IN",
     )
     result = scrapfly.scrape(config)
-    (OUT / "ndtv_debug.html").write_text(result.content)
+    (OUT / "asian_games_debug.html").write_text(result.content)
     return result.content
 
 
-def parse(html: str, valid_names: set[str]) -> list[dict]:
+def parse(html: str, country_map: dict[str, str]) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     container = soup.select_one("ul.OlyT_ul")
     if not container:
@@ -67,7 +87,7 @@ def parse(html: str, valid_names: set[str]) -> list[dict]:
 
         country = NAME_MAP.get(country, country)
 
-        if country not in valid_names:
+        if country not in country_map:
             unknown_dropped.append(country)
             continue
         if country in seen:
@@ -84,8 +104,8 @@ def parse(html: str, valid_names: set[str]) -> list[dict]:
             continue
 
         g, s, b, tot = (int(x) for x in nums[:4])
-        rows.append({"country_name": country, "gold": g, "silver": s,
-                     "bronze": b, "total": tot})
+        rows.append({"country_name": country, "short_name": country_map[country],
+                     "gold": g, "silver": s, "bronze": b, "total": tot})
 
     if dupes_dropped:
         print(f"[warn] dropped {dupes_dropped} duplicate row(s)")
@@ -124,19 +144,24 @@ def upsert(rows: list[dict], stamp: str):
     for r in rows:
         payload.append({
             "country_name": r["country_name"],
+            "short_name": r["short_name"],  # NOT NULL — must be sent even on update
             "gold": r["gold"], "silver": r["silver"],
             "bronze": r["bronze"],
+            # "total" is DB-generated — omitted (confirmed via APIError 428C9
+            # while seeding mock data)
             "rank": r["rank"],
             "updated_at": stamp,
         })
-    resp = supabase.table("medal_tally").upsert(payload, on_conflict="country_name").execute()
+    resp = supabase.table("asian_games_medal_tally").upsert(
+        payload, on_conflict="country_name"
+    ).execute()
     print(f"upserted {len(resp.data)} rows to Supabase")
 
 
 if __name__ == "__main__":
-    valid_names = get_valid_names()
+    country_map = get_country_map()
     html = fetch_html()
-    rows = parse(html, valid_names)
+    rows = parse(html, country_map)
     rows = add_ranks(rows)
     errs = validate(rows)
 
