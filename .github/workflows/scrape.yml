@@ -1,9 +1,13 @@
-name: CWG 2026 Medal Tally Scraper
+name: Asian Para Games 2026 Medal Tally Scraper
 
 on:
   schedule:
-    - cron: "30 2-17 * * *"   # UTC 2:30–17:30 = IST 8:00 AM–11:00 PM, hourly
+    - cron: "30 0-15 * * *"   # UTC 0:30–15:30 = IST 6:00 AM–9:00 PM, hourly
   workflow_dispatch:
+
+concurrency:
+  group: medal-tally
+  cancel-in-progress: false
 
 jobs:
   scrape:
@@ -20,11 +24,23 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install playwright beautifulsoup4
+          python -m playwright install --with-deps chromium
 
       - name: Run medal tally scraper
         env:
           SCRAPFLY_API_KEY: ${{ secrets.SCRAPFLY_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python sc.py
+
+      - name: Upload debug HTML on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html-${{ github.run_id }}
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
