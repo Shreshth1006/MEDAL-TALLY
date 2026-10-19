@@ -168,9 +168,13 @@ def parse_tally(html: str) -> list[dict]:
             continue
         name = " ".join(cells[0].split())
         g, s, b, t = (to_int(x) for x in cells[1:5])
-        if g + s + b != t:
-            raise ValueError(f"row total mismatch for {name}: {g}+{s}+{b} != {t}")
-        rows.append({"espn_name": name, "gold": g, "silver": s, "bronze": b})
+        # A row whose G+S+B doesn't match its own Total is a typo on the source page.
+        # Flag it instead of aborting; main() keeps that country's current DB values.
+        rows.append({"espn_name": name, "gold": g, "silver": s, "bronze": b,
+                     "bad_total": (g + s + b != t), "espn_total": t})
+    bad = [r for r in rows if r["bad_total"]]
+    if len(bad) > 3:  # many broken rows means a shifted column / misparse, not a typo
+        raise ValueError(f"{len(bad)} rows where G+S+B != Total, e.g. {bad[0]['espn_name']}; layout changed?")
     return rows
 
 
@@ -186,8 +190,26 @@ def map_names(rows: list[dict], valid_names: set[str]) -> tuple[list[dict], list
         if name in seen:
             continue
         seen.add(name)
-        out.append({"country_name": name, "gold": r["gold"], "silver": r["silver"], "bronze": r["bronze"]})
+        out.append({"country_name": name, "gold": r["gold"], "silver": r["silver"], "bronze": r["bronze"],
+                    "bad_total": r.get("bad_total", False), "espn_total": r.get("espn_total")})
     return out, dropped
+
+
+def apply_bad_row_fallback(rows: list[dict], db: dict[str, dict]) -> None:
+    """For rows ESPN got internally wrong, keep the country's current DB counts (still used for ranking)."""
+    for r in rows:
+        if not r.pop("bad_total", False):
+            r.pop("espn_total", None)
+            continue
+        espn = f"{r['gold']}+{r['silver']}+{r['bronze']} != {r.pop('espn_total')}"
+        if r["country_name"] in db:
+            cur = db[r["country_name"]]
+            r.update(gold=cur["gold"], silver=cur["silver"], bronze=cur["bronze"])
+            print(f"WARNING: ESPN row for {r['country_name']} is inconsistent ({espn}); "
+                  f"kept current DB values {cur['gold']}-{cur['silver']}-{cur['bronze']}", file=sys.stderr)
+        else:
+            print(f"WARNING: ESPN row for {r['country_name']} is inconsistent ({espn}); "
+                  f"no DB values to fall back on, using ESPN G/S/B", file=sys.stderr)
 
 
 def assign_ranks(rows: list[dict]) -> None:
@@ -271,6 +293,7 @@ def main() -> int:
             print(f"WARNING: dropped names not in {TABLE}: {dropped} -> add them to NAME_MAP", file=sys.stderr)
         if len(rows) < MIN_ROWS:
             raise ValueError(f"only {len(rows)} rows matched the table after mapping")
+        apply_bad_row_fallback(rows, db)
 
         # Guard: medal totals should never fall a lot between runs; a big drop means a bad page.
         if db and os.environ.get("FORCE") != "1":
