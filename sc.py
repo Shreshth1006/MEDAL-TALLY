@@ -64,9 +64,11 @@ SUPABASE_KEY = env("SUPABASE_SERVICE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "SUPABAS
 SCRAPFLY_KEY = env("SCRAPFLY_KEY", "SCRAPFLY_API_KEY")
 DEBUG_DIR = Path("debug")
 
-# ESPN lists 40 of the 45 NPCs (Bhutan, Maldives, Palestine, Timor-Leste and Yemen
-# were missing on 18 Oct). It may add rows later, so accept a range, not an exact count.
-MIN_ROWS, MAX_ROWS = 35, 45
+# ESPN's row count changes: 40 of the 45 NPCs on 18 Oct, trimmed to 32 on 21 Oct (some
+# zero-medal countries dropped). Countries missing from the page are simply not written,
+# so they keep their current values. The floor only catches a truncated/broken page;
+# the medal-drop guard in main() catches a page that lost medal rows.
+MIN_ROWS, MAX_ROWS = 20, 45
 
 # ESPN's spelling -> candidate spellings in our table (first one that exists wins).
 # Brunei is listed both ways so it works whether or not the rename to
@@ -294,6 +296,17 @@ def main() -> int:
         if len(rows) < MIN_ROWS:
             raise ValueError(f"only {len(rows)} rows matched the table after mapping")
         apply_bad_row_fallback(rows, db)
+
+        # A country that already has medals but vanished from the page keeps its old counts;
+        # flag it so a silently dropped medal row gets noticed.
+        on_page = {r["country_name"] for r in rows}
+        missing = [n for n, r in db.items() if n not in on_page and (r["gold"] + r["silver"] + r["bronze"]) > 0]
+        if missing:
+            print(f"WARNING: countries with medals not on ESPN this run (kept as-is): {missing}", file=sys.stderr)
+            # keep them in the ranking with their current counts (re-written unchanged, rank recomputed)
+            for n in missing:
+                rows.append({"country_name": n, "gold": db[n]["gold"], "silver": db[n]["silver"],
+                             "bronze": db[n]["bronze"]})
 
         # Guard: medal totals should never fall a lot between runs; a big drop means a bad page.
         if db and os.environ.get("FORCE") != "1":
